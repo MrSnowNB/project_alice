@@ -1,7 +1,7 @@
 import os
 import chromadb
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
-from langchain_text_splitters import CharacterTextSplitter
+from langchain_text_splitters import CharacterTextSplitter, RecursiveCharacterTextSplitter, Language
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import Chroma
 
@@ -29,30 +29,39 @@ def main():
             os.makedirs(directory)
             print(f"Created source directory at '{directory}'.")
 
-    # --- 2. Load Documents ---
-    print(f"Loading documents from {SOURCE_DIRS}...")
-    documents = []
+    # --- 2. Load and Chunk Documents ---
+    print(f"Loading and chunking documents from {SOURCE_DIRS}...")
+    chunked_docs = []
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    python_splitter = RecursiveCharacterTextSplitter.from_language(
+        language=Language.PYTHON, chunk_size=1000, chunk_overlap=200
+    )
+
     for source_dir in SOURCE_DIRS:
         for filename in os.listdir(source_dir):
             file_path = os.path.join(source_dir, filename)
-            if filename.endswith(".txt"):
-                loader = TextLoader(file_path, encoding='utf-8')
-                documents.extend(loader.load())
-            elif filename.endswith(".pdf"):
-                loader = PyPDFLoader(file_path)
-                documents.extend(loader.load())
-            elif filename.endswith(".py"):
-                loader = TextLoader(file_path, encoding='utf-8') # TextLoader works well for .py files
-                documents.extend(loader.load())
+            try:
+                if filename.endswith(".txt"):
+                    loader = TextLoader(file_path, encoding='utf-8')
+                    docs = loader.load()
+                    chunked_docs.extend(text_splitter.split_documents(docs))
+                elif filename.endswith(".pdf"):
+                    loader = PyPDFLoader(file_path)
+                    docs = loader.load()
+                    chunked_docs.extend(text_splitter.split_documents(docs))
+                elif filename.endswith(".py"):
+                    loader = TextLoader(file_path, encoding='utf-8')
+                    docs = loader.load()
+                    chunked_docs.extend(python_splitter.split_documents(docs))
+            except Exception as e:
+                print(f"Warning: Failed to load or chunk file '{file_path}'. Error: {e}")
+                # Continue to the next file
+                continue
     
-    if not documents:
+    if not chunked_docs:
         print("No documents found to index. Exiting.")
         return
 
-    # --- 3. Chunk Documents ---
-    # The plan mentions AST-based chunking; we'll start with a simpler text splitter.
-    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunked_docs = text_splitter.split_documents(documents)
     print(f"Split documents into {len(chunked_docs)} chunks.")
 
     # --- 4. Create Embeddings and Store in ChromaDB ---
