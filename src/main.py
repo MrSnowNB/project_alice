@@ -171,7 +171,7 @@ Review the plan, the conversation history, and the steps you have already comple
 Do not explain your reasoning or ask for clarification. Your output must be a tool call.
 
 The overall plan is:
-{state['plan']}""")
+{state['plan']}
 
 You have already completed the following steps:
 {completed_steps_str}""")
