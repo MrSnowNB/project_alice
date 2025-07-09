@@ -1,0 +1,8 @@
+langchain
+langchain-community
+langgraph
+requests
+sentence-transformers
+chromadb
+googlesearch-python
+beautifulsoup4

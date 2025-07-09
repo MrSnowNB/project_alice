@@ -1,0 +1,18 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment folders
+venv/
+.venv/
+env/
+.env/
+
+# Local database files from the knowledge base
+knowledge_base/chroma_db/
+
+# IDE / Editor specific
+.vscode/
+.idea/
