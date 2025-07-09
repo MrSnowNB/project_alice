@@ -102,4 +102,4 @@ def add_to_memory_service():
 if __name__ == '__main__':
     load_models_and_db()
     # Using a specific port for the memory service to avoid conflicts
-    app.run(port=5001, debug=True)
+    app.run(port=5001, debug=True, use_reloader=False)

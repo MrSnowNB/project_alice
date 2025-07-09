@@ -1,72 +1,44 @@
 
 import os
+import json
 import shlex
 import subprocess
 import requests
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import SentenceTransformerEmbeddings
-from sentence_transformers import CrossEncoder
 from googlesearch import search
 from bs4 import BeautifulSoup
 
-# Define constants consistent with the indexer
-KNOWLEDGE_BASE_DIR = "knowledge_base"
-DB_DIR = os.path.join(KNOWLEDGE_BASE_DIR, "chroma_db")
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+# --- Configuration for the Memory Sub-Agent Service ---
+MEMORY_SERVICE_URL = "http://127.0.0.1:5001"
  
 def retrieve_from_memory(query: str) -> dict:
-    """Searches the agent's knowledge base for information relevant to the query."""
+    """Searches the agent's knowledge base for information relevant to the query by calling the memory sub-agent."""
     print(f"Searching memory for: '{query}'")
-    if not os.path.exists(DB_DIR):
-        return {"error": "Knowledge base not found. Please run the indexer first."}
-
     try:
-        embedding_function = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL)
-        db = Chroma(persist_directory=DB_DIR, embedding_function=embedding_function)
-        
-        # 1. Retrieve a larger set of documents for reranking (e.g., top 10)
-        print("Step 1: Retrieving initial candidates from vector store...")
-        retrieved_docs = db.similarity_search(query, k=10)
-        
-        if not retrieved_docs:
+        response = requests.post(f"{MEMORY_SERVICE_URL}/query", json={"query": query}, timeout=10)
+        response.raise_for_status()
+        response_data = response.json()
+        if "error" in response_data:
+            return {"error": response_data["error"]}
+        # Format the context for the LLM
+        context = "\n\n---\n\n".join([doc['content'] for doc in response_data.get("relevant_context", [])])
+        if not context:
             return {"result": "No relevant information found in memory."}
-        
-        # 2. Rerank the results using a cross-encoder model
-        print("Step 2: Reranking candidates with a cross-encoder...")
-        cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-        doc_contents = [doc.page_content for doc in retrieved_docs]
-        
-        # The model expects a list of [query, document] pairs
-        pairs = [[query, doc] for doc in doc_contents]
-        scores = cross_encoder.predict(pairs)
-        
-        # Combine documents with their new scores and sort
-        scored_docs = sorted(zip(scores, retrieved_docs), key=lambda x: x[0], reverse=True)
-        
-        # 3. Return the top 3 reranked documents
-        top_docs = [doc for score, doc in scored_docs[:3]]
-        context = "\n\n---\n\n".join([doc.page_content for doc in top_docs])
         return {"relevant_context": context}
-        
     except Exception as e:
-        return {"error": f"An error occurred while retrieving from memory: {e}"}
+        return {"error": f"Failed to connect to memory service: {e}"}
 
 def add_to_memory(text_to_remember: str) -> dict:
     """
     Adds a piece of text to the agent's long-term memory (knowledge base).
     Use this to remember important facts, user preferences, or successful solutions.
     """
-    print(f"Adding to memory: '{text_to_remember}'")
+    print(f"Adding to memory: '{text_to_remember[:100]}...'")
     try:
-        embedding_function = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL)
-        db = Chroma(
-            persist_directory=DB_DIR,
-            embedding_function=embedding_function
-        )
-        db.add_texts(texts=[text_to_remember])
-        return {"status": "success", "message": "Information successfully added to memory."}
+        response = requests.post(f"{MEMORY_SERVICE_URL}/add", json={"text_to_remember": text_to_remember}, timeout=10)
+        response.raise_for_status()
+        return response.json()
     except Exception as e:
-        return {"error": f"An error occurred while adding to memory: {e}"}
+        return {"error": f"Failed to connect to memory service: {e}"}
 
 def search_the_web(query: str) -> dict:
     """Searches the web for a query and returns the text content of the top search result."""
@@ -113,8 +85,10 @@ def write_file(file_path: str, content: str) -> dict:
     except Exception as e:
         return {"error": f"Failed to write to file '{file_path}': {e}"}
 
-def execute_script(file_path: str, args: list[str]) -> dict:
+def execute_script(file_path: str, args: list[str] = None) -> dict:
     """Executes a script and returns a structured output."""
+    if args is None:
+        args = []
     print(f"Executing script: {file_path} with args: {args}")
     if not os.path.exists(file_path):
         return {"status": "error", "error": f"Script not found at path: {file_path}"}

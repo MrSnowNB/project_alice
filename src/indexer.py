@@ -8,42 +8,42 @@ from langchain_community.vectorstores import Chroma
 # Define constants
 KNOWLEDGE_BASE_DIR = "knowledge_base"
 DB_DIR = os.path.join(KNOWLEDGE_BASE_DIR, "chroma_db")
-SOURCE_DOCS_DIR = "source_documents" # A directory to hold raw files for indexing
+SOURCE_DIRS = ["source_documents", "src"] # A list of directories to index
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 def main():
     """
     Main function to build or update the vector store.
     This script will:
-    1. Check for source documents.
-    2. Load them.
+    1. Check for source documents in multiple directories.
+    2. Load them based on file type.
     3. Split them into chunks.
     4. Generate embeddings and store them in a persistent ChromaDB.
     """
     print("Starting indexer...")
 
     # --- 1. Setup ---
-    # Ensure source and DB directories exist
-    if not os.path.exists(SOURCE_DOCS_DIR):
-        os.makedirs(SOURCE_DOCS_DIR)
-        print(f"Created source documents directory at '{SOURCE_DOCS_DIR}'.")
-        # Create a placeholder file to prevent errors on the first run
-        with open(os.path.join(SOURCE_DOCS_DIR, "placeholder.txt"), "w") as f:
-            f.write("This is a placeholder file. Add text documents here to be indexed.")
-        print("Please add documents to be indexed in this directory.")
+    # Ensure source directories exist
+    for directory in SOURCE_DIRS:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+            print(f"Created source directory at '{directory}'.")
 
     # --- 2. Load Documents ---
-    print(f"Loading documents from '{SOURCE_DOCS_DIR}'...")
+    print(f"Loading documents from {SOURCE_DIRS}...")
     documents = []
-    for filename in os.listdir(SOURCE_DOCS_DIR):
-        file_path = os.path.join(SOURCE_DOCS_DIR, filename)
-        if filename.endswith(".txt"):
-            loader = TextLoader(file_path, encoding='utf-8')
-            documents.extend(loader.load())
-        elif filename.endswith(".pdf"):
-            loader = PyPDFLoader(file_path)
-            documents.extend(loader.load())
-        # Add other loaders here (e.g., for .docx, .csv)
+    for source_dir in SOURCE_DIRS:
+        for filename in os.listdir(source_dir):
+            file_path = os.path.join(source_dir, filename)
+            if filename.endswith(".txt"):
+                loader = TextLoader(file_path, encoding='utf-8')
+                documents.extend(loader.load())
+            elif filename.endswith(".pdf"):
+                loader = PyPDFLoader(file_path)
+                documents.extend(loader.load())
+            elif filename.endswith(".py"):
+                loader = TextLoader(file_path, encoding='utf-8') # TextLoader works well for .py files
+                documents.extend(loader.load())
     
     if not documents:
         print("No documents found to index. Exiting.")
