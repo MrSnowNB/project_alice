@@ -6,3 +6,5 @@ sentence-transformers
 chromadb
 googlesearch-python
 beautifulsoup4
+Flask
+pypdf

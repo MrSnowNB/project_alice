@@ -1,6 +1,6 @@
 import os
 import chromadb
-from langchain_community.document_loaders import TextLoader
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import CharacterTextSplitter
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -37,9 +37,13 @@ def main():
     documents = []
     for filename in os.listdir(SOURCE_DOCS_DIR):
         file_path = os.path.join(SOURCE_DOCS_DIR, filename)
-        if os.path.isfile(file_path):
+        if filename.endswith(".txt"):
             loader = TextLoader(file_path, encoding='utf-8')
             documents.extend(loader.load())
+        elif filename.endswith(".pdf"):
+            loader = PyPDFLoader(file_path)
+            documents.extend(loader.load())
+        # Add other loaders here (e.g., for .docx, .csv)
     
     if not documents:
         print("No documents found to index. Exiting.")
