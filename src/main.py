@@ -148,8 +148,6 @@ def replan(state: AgentState):
     replan_prompt = f"""You are an AI agent's planning module. The agent has been executing a task and has received new instructions from a human. 
 Review the entire conversation history and the original user goal. Your task is to create a new, actionable, step-by-step plan to achieve the original goal.
 
-**Critically analyze the user's latest instruction.** If the user instructs you to stop, abort, or report a finding as the final answer, your new plan MUST consist of a a single step: "1. Report the final answer to the user as requested." Do not try to continue debugging or achieving the original goal if the user has provided an exit command.
-
 **Critically analyze the history.** If the agent is stuck in a loop or not making progress, the new plan *must* introduce a new approach. For example, if the agent needs a new capability, the plan should include a step to use the `search_the_web` tool to find out how to build it.
 
 Original User Goal: {state['user_goal']}
@@ -184,7 +182,7 @@ Review the plan, the conversation history, and the steps you have already comple
 Do not explain your reasoning or ask for clarification. Your output must be a tool call.
 
 The overall plan is:
-{state['plan']}""")
+{state['plan']}
 
 You have already completed the following steps:
 {completed_steps_str}""")
@@ -249,6 +247,23 @@ def request_permission(state: AgentState):
     # If the tool is not dangerous, just pass through
     return state
 
+def check_for_exit(state: AgentState):
+    """Checks the user's last message for an exit command."""
+    last_human_message = ""
+    # Find the last message from the human to check for exit commands.
+    for message in reversed(state.get('messages', [])):
+        if isinstance(message, HumanMessage):
+            last_human_message = message.content.lower()
+            break
+            
+    # Keywords that signal the user wants to end the task.
+    exit_keywords = ["conclude", "final answer", "stop", "end the task", "exit"]
+    
+    if any(keyword in last_human_message for keyword in exit_keywords):
+        print("--- EXIT COMMAND DETECTED ---")
+        return "end"
+    else:
+        return "replan"
 
 def check_for_tool_error(state: AgentState):
     """Checks the last message for a tool error and routes accordingly."""
@@ -318,12 +333,36 @@ def handle_error(state: AgentState):
     return {"messages": state['messages'] + [HumanMessage(content=error_message)]}
 
 def generate_final_report(state: AgentState):
-    """Generates a structured final report upon task completion."""
+    """
+    Generates a structured final report by synthesizing the entire run with a final LLM call.
+    """
+    # 1. Get the necessary context from the state.
     user_goal = state['user_goal']
-    plan = state.get('plan', 'No plan was generated.')
+    final_plan = state.get('plan', 'No plan was generated.') # This will now be the *last* plan.
     completed_steps = state.get('completed_plan_steps', [])
-    final_response = state['messages'][-1].content
+    history_str = format_history_for_prompt(state.get('messages', []))
 
+    # 2. Create a dedicated prompt for the final summarization.
+    report_prompt = f"""You are the summarization module for an AI agent. 
+Your task is to write the "Agent's Final Answer" section of a final report.
+Based on the original user goal and the full conversation history, write a concise, final answer that summarizes the outcome of the task.
+Explain the key findings, including any errors encountered or reasons the task could not be completed.
+
+Original User Goal: {user_goal}
+
+Full Conversation History:
+---
+{history_str}
+---
+
+Provide only the final summary answer for the report.
+"""
+    
+    # 3. Call the LLM to generate the final, synthesized answer.
+    final_answer_message = invoke_llm([HumanMessage(content=report_prompt)], use_tools=False)
+    final_answer = final_answer_message.content
+
+    # 4. Format the final report with the synthesized answer.
     completed_steps_str = "\n".join(f"- {step}" for step in completed_steps)
     if not completed_steps_str:
         completed_steps_str = "No steps were executed."
@@ -332,16 +371,13 @@ def generate_final_report(state: AgentState):
 # Agent Final Report
 
 ## User Goal
-> {state['user_goal']}
-
-## Final Plan
-{plan}
+> {user_goal}
 
 ## Executed Steps
 {completed_steps_str}
 
 ## Agent's Final Answer
-{final_response}
+{final_answer}
 """
     return {"final_report": report.strip()}
 
@@ -371,6 +407,7 @@ workflow.add_node("mark_step_complete", mark_step_complete)
 workflow.add_node("handle_human_assistance", handle_human_assistance)
 workflow.add_node("request_permission", request_permission)
 workflow.add_node("handle_error", handle_error)
+workflow.add_node("check_for_exit", check_for_exit)
 workflow.add_node("final_report_generator", generate_final_report)
 
 # Set the entry point
@@ -386,8 +423,12 @@ workflow.add_conditional_edges(
     {"assistance": "handle_human_assistance", "permission": "request_permission", "end": "final_report_generator"}
 )
 
-# After getting human help, the agent should replan.
-workflow.add_edge("handle_human_assistance", "replan")
+# After getting human help, check if the user wants to exit.
+workflow.add_conditional_edges(
+    "handle_human_assistance",
+    check_for_exit,
+    {"replan": "replan", "end": "final_report_generator"}
+)
 workflow.add_edge("replan", "planner")
 
 # After requesting permission, decide where to go
