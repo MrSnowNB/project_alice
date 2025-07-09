@@ -1,6 +1,4 @@
-
 import os
-import json
 import shlex
 import subprocess
 import requests
@@ -9,35 +7,39 @@ from bs4 import BeautifulSoup
 
 # --- Configuration for the Memory Sub-Agent Service ---
 MEMORY_SERVICE_URL = "http://127.0.0.1:5001"
- 
+
 def retrieve_from_memory(query: str) -> dict:
-    """Searches the agent's knowledge base for information relevant to the query by calling the memory sub-agent."""
-    print(f"Searching memory for: '{query}'")
+    """
+    Searches the agent's knowledge base for information relevant to the query by calling the memory sub-agent.
+    """
+    print(f"Querying memory service for: '{query}'")
     try:
         response = requests.post(f"{MEMORY_SERVICE_URL}/query", json={"query": query}, timeout=10)
-        response.raise_for_status()
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+        
         response_data = response.json()
         if "error" in response_data:
             return {"error": response_data["error"]}
+            
         # Format the context for the LLM
         context = "\n\n---\n\n".join([doc['content'] for doc in response_data.get("relevant_context", [])])
         if not context:
             return {"result": "No relevant information found in memory."}
+            
         return {"relevant_context": context}
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         return {"error": f"Failed to connect to memory service: {e}"}
 
 def add_to_memory(text_to_remember: str) -> dict:
     """
-    Adds a piece of text to the agent's long-term memory (knowledge base).
-    Use this to remember important facts, user preferences, or successful solutions.
+    Adds a piece of text to the agent's long-term memory by calling the memory sub-agent.
     """
-    print(f"Adding to memory: '{text_to_remember[:100]}...'")
+    print(f"Sending to memory service: '{text_to_remember[:100]}...'")
     try:
         response = requests.post(f"{MEMORY_SERVICE_URL}/add", json={"text_to_remember": text_to_remember}, timeout=10)
         response.raise_for_status()
         return response.json()
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         return {"error": f"Failed to connect to memory service: {e}"}
 
 def search_the_web(query: str) -> dict:
@@ -46,9 +48,16 @@ def search_the_web(query: str) -> dict:
     try:
         # Get the first URL from the search results
         try:
-            url = next(search(query, stop=1))
+            # ROBUST FIX: Remove the problematic argument and just get the iterator.
+            search_results = search(query)
+            # Then, take the first result from the iterator.
+            url = next(search_results)
         except StopIteration:
             return {"result": "No search results found."}
+
+        # Add a check to ensure the URL is not empty or None
+        if not url:
+            return {"result": "Search returned an empty URL."}
 
         print(f"Scraping content from: {url}")
         # Scrape the content from the URL
@@ -102,10 +111,8 @@ def execute_script(file_path: str, args: list[str] = None) -> dict:
         )
         return {"status": "success", "stdout": result.stdout, "stderr": result.stderr}
     except subprocess.CalledProcessError as e:
-        # This exception is raised when the script has a non-zero exit code.
         return {"status": "script_error", "stdout": e.stdout, "stderr": e.stderr, "return_code": e.returncode}
     except FileNotFoundError:
-        # This error means the 'python' command itself was not found.
         return {"status": "execution_error", "error": "The 'python' command was not found. Is Python installed and in your PATH?"}
     except Exception as e:
         return {"status": "execution_error", "error": str(e)}
@@ -114,7 +121,6 @@ def run_shell_command(command: str) -> dict:
     """Executes a shell command and returns the output."""
     print(f"Executing shell command: {command}")
     try:
-        # Use shlex.split to safely parse the command and avoid shell=True
         args = shlex.split(command)
         result = subprocess.run(
             args,
@@ -125,7 +131,6 @@ def run_shell_command(command: str) -> dict:
         )
         return {"status": "success", "stdout": result.stdout, "stderr": result.stderr}
     except subprocess.CalledProcessError as e:
-        # Command returned a non-zero exit code
         return {"status": "command_error", "stdout": e.stdout, "stderr": e.stderr, "return_code": e.returncode}
     except FileNotFoundError:
         return {"status": "execution_error", "error": f"Command not found: '{args[0]}'. Please ensure it is installed and in your PATH."}
@@ -135,8 +140,5 @@ def run_shell_command(command: str) -> dict:
 def request_human_assistance(request: str) -> str:
     """
     Asks for human assistance when the agent is stuck or needs a new capability.
-    Use this to request a new tool, ask for clarification, or report an unrecoverable error.
-    The human's response will be provided in the next step.
     """
-    # This is a placeholder. The graph will intercept this call.
     return "The human has been notified. Please await their response."
