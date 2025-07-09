@@ -2,6 +2,9 @@ import json
 import requests
 import sys
 import os
+import click
+import importlib.util
+from pathlib import Path
 
 # Add the project root to the Python path to allow for absolute imports
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -11,24 +14,53 @@ if project_root not in sys.path:
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage, BaseMessage
-from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from src.state import AgentState
-from src.tools import retrieve_from_memory, search_the_web, write_file, execute_script, run_shell_command, add_to_memory, request_human_assistance
+from src.tools import (
+    retrieve_from_memory, 
+    search_the_web, 
+    write_file, 
+    execute_script, 
+    run_shell_command, 
+    add_to_memory, 
+    request_human_assistance
+)
 
-# Define the tools the agent can use
-tools = [retrieve_from_memory, search_the_web, write_file, execute_script, run_shell_command, add_to_memory, request_human_assistance]
+# --- Dynamic Tool Loading ---
+def load_generated_tools():
+    """Dynamically loads tools from the generated_tools directory."""
+    generated_tools_dir = Path(project_root) / "src" / "generated_tools"
+    generated_tools_dir.mkdir(exist_ok=True)
+    (generated_tools_dir / "__init__.py").touch(exist_ok=True)
+    
+    loaded_tools = []
+    for file_path in generated_tools_dir.glob("*.py"):
+        if file_path.name == "__init__.py":
+            continue
+        
+        module_name = f"src.generated_tools.{file_path.stem}"
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            tool_function = getattr(module, file_path.stem, None)
+            if callable(tool_function):
+                print(f"Dynamically loaded tool: {file_path.stem}")
+                loaded_tools.append(tool_function)
+    return loaded_tools
 
-# Define a list of tools that require user confirmation before execution
+# --- Initial Tool Setup ---
+base_tools = [
+    retrieve_from_memory, search_the_web, write_file, 
+    execute_script, run_shell_command, add_to_memory, request_human_assistance
+]
 DANGEROUS_TOOLS = ["write_file", "execute_script", "run_shell_command"]
 
-# --- Custom LLM Invocation (No LangChain Model Wrapper) ---
+# --- API Configuration ---
 API_URL = "http://localhost:1234/v1/chat/completions"
-# Note: The model name might need to be adjusted based on what's running in your LM Studio
 MODEL_NAME = "local-model" 
 
 def format_messages_for_api(messages: list[BaseMessage]) -> list[dict]:
-    """Converts LangChain message objects to a list of dictionaries for the API."""
     api_messages = []
     for message in messages:
         if isinstance(message, HumanMessage):
@@ -56,22 +88,22 @@ def format_messages_for_api(messages: list[BaseMessage]) -> list[dict]:
             api_messages.append({
                 "role": "tool",
                 "tool_call_id": message.tool_call_id,
-                "content": message.content
+                "content": str(message.content)
             })
     return api_messages
 
-def invoke_llm(messages: list[BaseMessage], use_tools: bool = False) -> AIMessage:
-    """Invokes the LLM via a direct API call."""
+def invoke_llm(messages: list[BaseMessage], available_tools: list) -> AIMessage:
+    from langchain_core.utils.function_calling import convert_to_openai_tool
     api_messages = format_messages_for_api(messages)
     
     payload = {"model": MODEL_NAME, "messages": api_messages, "temperature": 0}
-    if use_tools:
-        payload["tools"] = [convert_to_openai_tool(tool) for tool in tools]
+    if available_tools:
+        payload["tools"] = [convert_to_openai_tool(tool) for tool in available_tools]
 
     headers = {"Content-Type": "application/json"}
     
     try:
-        response = requests.post(API_URL, headers=headers, json=payload)
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
         response_data = response.json()
         message_data = response_data['choices'][0]['message']
@@ -100,20 +132,23 @@ def invoke_llm(messages: list[BaseMessage], use_tools: bool = False) -> AIMessag
 # --- Node Definitions ---
 
 def create_plan(state: AgentState):
-    """Creates a multi-step plan to achieve the user's goal."""
-    plan_prompt = f"""Based on the user's goal, create a concise, step-by-step plan to achieve it.
-Each step should be a clear action for the agent.
+    """Creates a multi-step plan grounded in the available tools."""
+    available_tools = base_tools + load_generated_tools()
+    tool_names = ", ".join([tool.__name__ for tool in available_tools])
+    
+    plan_prompt = f"""Based on the user's goal and the available tools, create a concise, step-by-step plan to achieve the goal.
+You can only use the tools provided. Do not make assumptions about information you do not have. Your first step should almost always be to gather information.
+
+Available Tools: {tool_names}
 
 User Goal: {state['user_goal']}
 
 Respond with only the plan, formatted as a numbered list."""
     
-    messages = [HumanMessage(content=plan_prompt)]
-    response = invoke_llm(messages, use_tools=False)
-    return {"plan": response.content}
+    response = invoke_llm([HumanMessage(content=plan_prompt)], available_tools=[])
+    return {"plan": response.content, "messages": []}
 
 def format_history_for_prompt(messages: list[BaseMessage]) -> str:
-    """Formats the message history into a readable string for a prompt."""
     history = []
     for msg in messages:
         if isinstance(msg, HumanMessage):
@@ -121,9 +156,7 @@ def format_history_for_prompt(messages: list[BaseMessage]) -> str:
         elif isinstance(msg, AIMessage):
             if msg.tool_calls:
                 tool_info = msg.tool_calls[0] if msg.tool_calls else {}
-                tool_name = tool_info.get('name', 'unknown_tool')
-                tool_args = tool_info.get('args', {})
-                history.append(f"AI (Tool Call): {tool_name}({tool_args})")
+                history.append(f"AI (Tool Call): {tool_info.get('name', 'unknown_tool')}({tool_info.get('args', {})})")
             else:
                 history.append(f"AI: {msg.content}")
         elif isinstance(msg, ToolMessage):
@@ -131,13 +164,22 @@ def format_history_for_prompt(messages: list[BaseMessage]) -> str:
     return "\n".join(history)
 
 def replan(state: AgentState):
-    """Creates a new plan after a failure or human feedback."""
+    """Creates a new, grounded plan after a failure or human feedback."""
+    available_tools = base_tools + load_generated_tools()
+    tool_names = ", ".join([tool.__name__ for tool in available_tools])
     history_str = format_history_for_prompt(state.get('messages', []))
+
     replan_prompt = f"""You are an AI agent's planning module. The agent has hit an error or received new human feedback.
-Review the entire conversation history and the original user goal. Your task is to create a new, actionable, step-by-step plan to achieve the original goal.
+Review the conversation history, the user's goal, and the available tools. Create a new, actionable, step-by-step plan to achieve the goal.
 
-**Critically analyze the history.** The previous plan failed. The new plan *must* introduce a new approach to get past the error. For example, if a tool failed, try calling it with different parameters or use a different tool entirely. If a web search yields no results, try a different, more general search query.
+**Critically analyze the history.** The previous plan failed. The new plan *must* introduce a new approach.
+- If a tool failed, try calling it with different parameters or use a different tool.
+- If you lack a necessary capability, your new plan **MUST** include steps to create that tool. 
+  1. First, use `search_the_web` to find a Python code snippet for the desired functionality.
+  2. Then, use `write_file` to save this code as a new tool in the `src/generated_tools/` directory. The filename must be the function name (e.g., `get_weather.py`).
+  3. After writing the file, you can then use the new tool in a subsequent step.
 
+Available Tools: {tool_names}
 Original User Goal: {state['user_goal']}
 
 Conversation History:
@@ -147,8 +189,7 @@ Conversation History:
 
 Respond with only the new, revised plan, formatted as a numbered list."""
     
-    messages = [HumanMessage(content=replan_prompt)]
-    response = invoke_llm(messages, use_tools=False)
+    response = invoke_llm([HumanMessage(content=replan_prompt)], available_tools=[])
     print("--- NEW PLAN CREATED ---")
     print(response.content)
     return {"plan": response.content}
@@ -160,12 +201,17 @@ def planner(state: AgentState):
     if not completed_steps_str:
         completed_steps_str = "No steps completed yet."
 
+    # ENHANCED PROMPT FOR CRITICAL EVALUATION
     plan_context = HumanMessage(content=f"""You are an autonomous AI agent. Your job is to execute a plan to fulfill the user's goal.
 Review the plan, the conversation history, and the steps you have already completed. 
 
+**Analyze the most recent tool results very carefully.**
+- If the last tool call returned useful information that helps achieve the user's goal, continue with the next step in the plan.
+- If the last tool call failed or returned unhelpful, irrelevant, or generic information (like a help page), you MUST recognize this as a failure. Do not proceed with the plan. Instead, your response should be a call to the `request_human_assistance` tool, explaining that the previous approach failed and that you need a new strategy.
+
 Decide on the next step:
 1. If you have gathered all the necessary information and can now directly answer the user's goal, provide the final answer as a concise summary.
-2. Otherwise, select the single best tool to execute for the *next incomplete* step in the plan.
+2. Otherwise, select the single best tool to execute for the *next incomplete* step in the plan, unless the previous step failed as described above.
 
 The overall plan is:
 {state['plan']}
@@ -178,11 +224,11 @@ You have already completed the following steps:
     else:
         messages_for_llm = current_messages + [plan_context]
 
-    response = invoke_llm(messages_for_llm, use_tools=True)
+    available_tools = base_tools + load_generated_tools()
+    response = invoke_llm(messages_for_llm, available_tools=available_tools)
     return {"messages": current_messages + [response]}
 
 def route_after_planner(state: AgentState):
-    """Decides the next step after the planner has made a decision."""
     last_message = state['messages'][-1]
     if not last_message.tool_calls:
         return "end"
@@ -194,7 +240,6 @@ def route_after_planner(state: AgentState):
         return "permission"
 
 def request_permission(state: AgentState):
-    """Checks if the planned tool call is dangerous and asks for user permission."""
     last_message = state['messages'][-1]
     if not last_message.tool_calls:
         return state
@@ -222,7 +267,6 @@ def request_permission(state: AgentState):
     return state
 
 def check_for_exit(state: AgentState):
-    """Checks the user's last message for an exit command."""
     last_human_message = ""
     for message in reversed(state.get('messages', [])):
         if isinstance(message, HumanMessage):
@@ -232,35 +276,28 @@ def check_for_exit(state: AgentState):
     exit_keywords = ["conclude", "final answer", "stop", "end", "exit"]
     
     if any(keyword in last_human_message for keyword in exit_keywords):
-        print("--- EXIT COMMAND DETECTED ---")
         return "end"
     else:
         return "replan"
 
 def check_for_tool_error(state: AgentState):
-    """
-    Checks the last message for a tool error and routes accordingly.
-    Also treats unhelpful results as errors to be handled.
-    """
     last_message = state['messages'][-1]
     if not isinstance(last_message, ToolMessage):
         return "planner"
 
-    content_str = last_message.content
+    content_str = str(last_message.content)
     if '"status": "error"' in content_str or '"error":' in content_str or '"result": "No' in content_str or "Search returned an empty URL" in content_str:
         return "handle_error"
     else:
         return "mark_step_complete"
 
 def after_permission_check(state: AgentState):
-    """Routes to planner if permission was denied, otherwise to the tool executor."""
     last_message = state['messages'][-1]
     if isinstance(last_message, HumanMessage):
         return "planner"
     return "tool_executor"
 
 def handle_human_assistance(state: AgentState):
-    """Handles the agent's request for human help."""
     last_message = state['messages'][-1]
     if not last_message.tool_calls:
         return state
@@ -277,7 +314,6 @@ def handle_human_assistance(state: AgentState):
     return {"messages": messages}
 
 def mark_step_complete(state: AgentState):
-    """Marks the last executed step as complete."""
     if len(state.get('messages', [])) < 2:
         return state
 
@@ -296,21 +332,20 @@ def mark_step_complete(state: AgentState):
     return {"completed_plan_steps": completed_steps + [completed_step_summary]}
 
 def handle_error(state: AgentState):
-    """A dedicated node to process errors and formulate a recovery plan."""
     last_message = state['messages'][-1]
     error_message = f"The last tool call failed with the following output:\n\n{last_message.content}\n\nPlease analyze this error and create a plan to recover."
     return {"messages": state['messages'] + [HumanMessage(content=error_message)]}
 
 def execute_tools(state: AgentState):
-    """A robust custom node that executes tools and correctly appends the result."""
-    tool_node = ToolNode(tools)
+    available_tools = base_tools + load_generated_tools()
+    tool_node = ToolNode(available_tools)
+    
     result_dict = tool_node.invoke({"messages": state['messages']})
     new_tool_messages = result_dict.get('messages', [])
     messages = state.get('messages', []) + new_tool_messages
     return {"messages": messages}
 
 def generate_final_report(state: AgentState):
-    """Generates a structured final report."""
     user_goal = state['user_goal']
     history_str = format_history_for_prompt(state.get('messages', []))
 
@@ -324,11 +359,10 @@ Full Conversation History:
 ---
 {history_str}
 ---
-
-Provide only the final summary answer for the report.
+Your response should be only the text of the final answer, without any prefixes.
 """
     
-    final_answer_message = invoke_llm([HumanMessage(content=report_prompt)], use_tools=False)
+    final_answer_message = invoke_llm([HumanMessage(content=report_prompt)], available_tools=[])
     final_answer = final_answer_message.content
 
     completed_steps_str = "\n".join(f"- {step}" for step in state.get('completed_plan_steps', []))
@@ -366,46 +400,69 @@ workflow.add_node("final_report_generator", generate_final_report)
 workflow.set_entry_point("create_plan")
 workflow.add_edge("create_plan", "planner")
 
-workflow.add_conditional_edges(
-    "planner",
-    route_after_planner,
-    {"assistance": "handle_human_assistance", "permission": "request_permission", "end": "final_report_generator"}
-)
-
-workflow.add_conditional_edges(
-    "handle_human_assistance",
-    check_for_exit,
-    {"replan": "replan", "end": "final_report_generator"}
-)
+workflow.add_conditional_edges("planner", route_after_planner, {
+    "assistance": "handle_human_assistance", 
+    "permission": "request_permission", 
+    "end": "final_report_generator"
+})
+workflow.add_conditional_edges("handle_human_assistance", check_for_exit, {
+    "replan": "replan", "end": "final_report_generator"
+})
 workflow.add_edge("replan", "planner")
-
-workflow.add_conditional_edges(
-    "request_permission",
-    after_permission_check,
-    {"planner": "planner", "tool_executor": "tool_executor"}
-)
-
-workflow.add_conditional_edges(
-    "tool_executor",
-    check_for_tool_error,
-    {"mark_step_complete": "mark_step_complete", "handle_error": "handle_error"}
-)
-
-# FINAL BUG FIX: Route errors to the replan node to force a new strategy.
+workflow.add_conditional_edges("request_permission", after_permission_check, {
+    "planner": "planner", "tool_executor": "tool_executor"
+})
+workflow.add_conditional_edges("tool_executor", check_for_tool_error, {
+    "mark_step_complete": "mark_step_complete", "handle_error": "handle_error"
+})
 workflow.add_edge("handle_error", "replan")
 workflow.add_edge("mark_step_complete", "planner")
 workflow.add_edge("final_report_generator", END)
 
 app = workflow.compile()
 
-# Run the agent
-if __name__ == "__main__":
+# --- CLI Application ---
+def run_agent_task(goal: str, session_messages: list):
+    """Runs a single task through the agent graph."""
     inputs = {
-        "user_goal": "Search the web to find out who the current CEO of OpenAI is. Then, add this information to your long-term memory. Finally, retrieve the information from your memory and report it as your final answer."
+        "user_goal": goal,
+        "messages": session_messages,
+        "completed_plan_steps": []
     }
-    for output in app.stream(inputs):
+    
+    final_state = None
+    for output in app.stream(inputs, {"recursion_limit": 100}):
         for key, value in output.items():
             print(f"Output from node '{key}':")
             print("---")
-            print(value)
+            if key == "final_report_generator":
+                print(value.get("final_report"))
+                final_state = value
+            else:
+                print(value)
         print("\n---\n")
+
+    return final_state.get('messages', []) if final_state else session_messages
+
+@click.command()
+def cli():
+    """An interactive CLI for the Alice agent."""
+    print("Welcome to the Alice Agent CLI. Type your goal and press Enter.")
+    print("Type 'exit' or 'quit' to end the session.")
+    
+    session_messages = []
+    while True:
+        try:
+            goal = input("Alice>: ")
+            if goal.lower() in ['exit', 'quit']:
+                break
+            session_messages = run_agent_task(goal, session_messages)
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            break
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            break
+
+if __name__ == "__main__":
+    cli()

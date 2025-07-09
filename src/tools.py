@@ -42,6 +42,17 @@ def add_to_memory(text_to_remember: str) -> dict:
     except requests.exceptions.RequestException as e:
         return {"error": f"Failed to connect to memory service: {e}"}
 
+def http_get(url: str, params: dict = None) -> dict:
+    """Makes an HTTP GET request to the specified URL and returns the response text."""
+    print(f"Making HTTP GET request to: {url} with params: {params}")
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        # Return the raw text content. The LLM can parse it.
+        return {"response_text": response.text}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"HTTP GET request failed: {e}"}
+
 def search_the_web(query: str) -> dict:
     """Searches the web for a query and returns the text content of the top search result."""
     print(f"Searching the web for: '{query}'")
