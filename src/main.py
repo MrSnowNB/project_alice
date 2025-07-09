@@ -38,10 +38,21 @@ def format_messages_for_api(messages: list[BaseMessage]) -> list[dict]:
         elif isinstance(message, AIMessage):
             # Handle tool calls in AIMessage
             if message.tool_calls:
+                # Re-serialize tool calls into the format the API expects
+                api_tool_calls = []
+                for tool_call in message.tool_calls:
+                    api_tool_calls.append({
+                        "id": tool_call.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.get("name"),
+                            "arguments": json.dumps(tool_call.get("args", {}))
+                        }
+                    })
                 api_messages.append({
                     "role": "assistant",
                     "content": message.content or "", # content can be None
-                    "tool_calls": message.tool_calls
+                    "tool_calls": api_tool_calls
                 })
             else:
                 api_messages.append({"role": "assistant", "content": message.content})
@@ -136,6 +147,8 @@ def replan(state: AgentState):
     history_str = format_history_for_prompt(state.get('messages', []))
     replan_prompt = f"""You are an AI agent's planning module. The agent has been executing a task and has received new instructions from a human. 
 Review the entire conversation history and the original user goal. Your task is to create a new, actionable, step-by-step plan to achieve the original goal.
+
+**Critically analyze the user's latest instruction.** If the user instructs you to stop, abort, or report a finding as the final answer, your new plan MUST consist of a a single step: "1. Report the final answer to the user as requested." Do not try to continue debugging or achieving the original goal if the user has provided an exit command.
 
 **Critically analyze the history.** If the agent is stuck in a loop or not making progress, the new plan *must* introduce a new approach. For example, if the agent needs a new capability, the plan should include a step to use the `search_the_web` tool to find out how to build it.
 
@@ -278,12 +291,16 @@ def handle_human_assistance(state: AgentState):
 
 def mark_step_complete(state: AgentState):
     """Marks the last executed step as complete."""
+    # Add a guard clause to check the length of the messages list.
+    if len(state.get('messages', [])) < 2:
+        return state # Not enough messages to determine the last tool call, so we exit.
+
     # The tool call that was just executed is in the second-to-last message.
     # The last message is the ToolMessage with the result.
     last_ai_message = state['messages'][-2]
     
     if not isinstance(last_ai_message, AIMessage) or not last_ai_message.tool_calls:
-        return state # Should not happen, but safeguard
+        return state # Safeguard if the message structure is not as expected.
         
     tool_call = last_ai_message.tool_calls[0]
     tool_name = tool_call.get("name")
@@ -328,6 +345,18 @@ def generate_final_report(state: AgentState):
 """
     return {"final_report": report.strip()}
 
+def execute_tools(state: AgentState):
+    """A custom node that executes tools and appends the result to the messages list."""
+    tool_node = ToolNode(tools)
+    # The ToolNode returns a dictionary like {'messages': [ToolMessage(...)]}
+    # We must extract the list of messages from this dictionary.
+    result_dict = tool_node.invoke(state)
+    tool_call_results = result_dict.get('messages', [])
+    
+    # We must append the result(s) to the existing messages, not overwrite them.
+    messages = state['messages'] + tool_call_results
+    return {"messages": messages}
+
 # --- Graph Definition ---
 # Define the graph
 workflow = StateGraph(AgentState)
@@ -337,8 +366,7 @@ workflow.add_node("create_plan", create_plan)
 workflow.add_node("planner", planner)
 workflow.add_node("replan", replan)
 # The tool_node executes the tools chosen by the planner
-tool_node = ToolNode(tools)
-workflow.add_node("tool_executor", tool_node)
+workflow.add_node("tool_executor", execute_tools)
 workflow.add_node("mark_step_complete", mark_step_complete)
 workflow.add_node("handle_human_assistance", handle_human_assistance)
 workflow.add_node("request_permission", request_permission)

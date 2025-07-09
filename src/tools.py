@@ -113,8 +113,10 @@ def write_file(file_path: str, content: str) -> dict:
     except Exception as e:
         return {"error": f"Failed to write to file '{file_path}': {e}"}
 
-def execute_script(file_path: str, args: list[str]) -> dict:
+def execute_script(file_path: str, args: list[str] = None) -> dict:
     """Executes a script and returns a structured output."""
+    if args is None:
+        args = []
     print(f"Executing script: {file_path} with args: {args}")
     if not os.path.exists(file_path):
         return {"status": "error", "error": f"Script not found at path: {file_path}"}
