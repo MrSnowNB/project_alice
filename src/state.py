@@ -9,3 +9,5 @@ class AgentState(TypedDict):
     final_report: str
     plan: str
     completed_plan_steps: List[str]
+    replan_attempts: int  # Tracks number of replan attempts for circuit breaker
+    failed_actions: List[str]  # Logs unique failed tool names for pattern detection

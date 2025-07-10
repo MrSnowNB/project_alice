@@ -2,6 +2,8 @@ import json
 import requests
 import sys
 import os
+import time  # For backoff in retries (Phase 3)
+import yaml  # For YAML frontmatter parsing (Phase 3)
 import click
 import importlib.util
 from pathlib import Path
@@ -26,27 +28,95 @@ from src.tools import (
     request_human_assistance
 )
 
-# --- Dynamic Tool Loading ---
-def load_generated_tools():
-    """Dynamically loads tools from the generated_tools directory."""
-    generated_tools_dir = Path(project_root) / "src" / "generated_tools"
-    generated_tools_dir.mkdir(exist_ok=True)
-    (generated_tools_dir / "__init__.py").touch(exist_ok=True)
+# --- Dynamic Tool Loading with Hybrid Metadata (Phase 3) ---
+TOOL_DIR = Path(project_root) / "src" / "generated_tools"
+MANIFEST_FILE = TOOL_DIR / "manifest.yaml"  # Central manifest for quick loading
+
+def extract_frontmatter(file_path: Path) -> dict:
+    """Extracts YAML frontmatter from a .py file."""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    if content.startswith('---\n'):
+        end_idx = content.find('\n---\n', 4)
+        if end_idx != -1:
+            yaml_str = content[4:end_idx]
+            try:
+                return yaml.safe_load(yaml_str) or {}
+            except yaml.YAMLError:
+                return {}
+    return {}
+
+def update_manifest(metadata: dict):
+    """Updates or creates the manifest with tool metadata."""
+    TOOL_DIR.mkdir(exist_ok=True)
+    manifest = {}
+    if MANIFEST_FILE.exists():
+        with open(MANIFEST_FILE, 'r', encoding='utf-8') as f:
+            manifest = yaml.safe_load(f) or {}
+    tool_name = metadata.get('name')
+    if tool_name:
+        manifest[tool_name] = metadata
+        with open(MANIFEST_FILE, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(manifest, f)
+
+def load_generated_tools(plan_text: str = "") -> list:
+    """Dynamically loads tools from generated_tools dir, filtered by plan relevance using hybrid metadata."""
+    TOOL_DIR.mkdir(exist_ok=True)
+    (TOOL_DIR / "__init__.py").touch(exist_ok=True)
+    
+    # Load manifest for quick metadata scan (efficient single-file read)
+    metadata_map = {}
+    if MANIFEST_FILE.exists():
+        with open(MANIFEST_FILE, 'r', encoding='utf-8') as f:
+            metadata_map = yaml.safe_load(f) or {}
+    
+    # Prune stale tools (e.g., last_used >30 days; optional, configurable)
+    import datetime
+    today = datetime.date.today()
+    for tool_name, meta in list(metadata_map.items()):
+        last_used = meta.get('last_used')
+        if last_used and (today - datetime.date.fromisoformat(last_used)).days > 30:
+            del metadata_map[tool_name]  # Prune from manifest; optionally delete file
     
     loaded_tools = []
-    for file_path in generated_tools_dir.glob("*.py"):
+    relevant_tools = []  # Filter based on plan (simple keyword match for efficiency)
+    if plan_text:
+        plan_lower = plan_text.lower()
+        for tool_name, meta in metadata_map.items():
+            tags = meta.get('tags', [])
+            desc = meta.get('description', '').lower()
+            if any(tag.lower() in plan_lower for tag in tags) or plan_lower in desc:
+                relevant_tools.append(tool_name)
+    else:
+        relevant_tools = list(metadata_map.keys())  # Load all if no plan filter
+    
+    for tool_name in relevant_tools:
+        file_path = TOOL_DIR / f"{tool_name}.py"
+        if file_path.exists():
+            module_name = f"src.generated_tools.{tool_name}"
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                tool_function = getattr(module, tool_name, None)
+                if callable(tool_function):
+                    print(f"Dynamically loaded tool: {tool_name}")
+                    loaded_tools.append(tool_function)
+                    # Update last_used in manifest
+                    metadata = metadata_map.get(tool_name, {})
+                    metadata['last_used'] = datetime.date.today().isoformat()
+                    update_manifest(metadata)
+    
+    # Rebuild manifest if any files missing (fallback sync)
+    for file_path in TOOL_DIR.glob("*.py"):
         if file_path.name == "__init__.py":
             continue
-        
-        module_name = f"src.generated_tools.{file_path.stem}"
-        spec = importlib.util.spec_from_file_location(module_name, file_path)
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            tool_function = getattr(module, file_path.stem, None)
-            if callable(tool_function):
-                print(f"Dynamically loaded tool: {file_path.stem}")
-                loaded_tools.append(tool_function)
+        tool_name = file_path.stem
+        if tool_name not in metadata_map:
+            metadata = extract_frontmatter(file_path)
+            if metadata:
+                update_manifest(metadata)
+    
     return loaded_tools
 
 # --- Initial Tool Setup ---
@@ -55,6 +125,8 @@ base_tools = [
     execute_script, run_shell_command, add_to_memory, request_human_assistance
 ]
 DANGEROUS_TOOLS = ["write_file", "execute_script", "run_shell_command"]
+
+MAX_REPLAN_ATTEMPTS = 3
 
 # --- API Configuration ---
 API_URL = "http://localhost:1234/v1/chat/completions"
@@ -165,19 +237,19 @@ def format_history_for_prompt(messages: list[BaseMessage]) -> str:
 
 def replan(state: AgentState):
     """Creates a new, grounded plan after a failure or human feedback."""
-    available_tools = base_tools + load_generated_tools()
+    current_attempts = state.get('replan_attempts', 0)
+    available_tools = base_tools + load_generated_tools(state['plan'])  # Phase 3: Pass plan for filtered loading
     tool_names = ", ".join([tool.__name__ for tool in available_tools])
     history_str = format_history_for_prompt(state.get('messages', []))
+    failed_actions_str = ", ".join(state.get('failed_actions', [])) or "None"
 
     replan_prompt = f"""You are an AI agent's planning module. The agent has hit an error or received new human feedback.
-Review the conversation history, the user's goal, and the available tools. Create a new, actionable, step-by-step plan to achieve the goal.
+Review the conversation history, the user's goal, the available tools, and the list of failed actions. Create a new, actionable, step-by-step plan to achieve the goal.
 
-**Critically analyze the history.** The previous plan failed. The new plan *must* introduce a new approach.
-- If a tool failed, try calling it with different parameters or use a different tool.
-- If you lack a necessary capability, your new plan **MUST** include steps to create that tool. 
-  1. First, use `search_the_web` to find a Python code snippet for the desired functionality.
-  2. Then, use `write_file` to save this code as a new tool in the `src/generated_tools/` directory. The filename must be the function name (e.g., `get_weather.py`).
-  3. After writing the file, you can then use the new tool in a subsequent step.
+**Critically analyze the history and failed_actions: {failed_actions_str}.** The previous plan failed. The new plan *must* introduce a new approach.
+- If the same tool or category failed multiple times (e.g., >2 API auth errors), do not repeat it. Instead, your plan MUST include steps to create a new tool or escalate.
+- For tool creation: 1. Use `search_the_web` to find a Python code snippet for the needed functionality (e.g., keyless weather scraper). 2. Use `write_file` to save it as a new tool in `src/generated_tools/` (filename = function name, e.g., get_weather_free.py). Include YAML frontmatter at the top for metadata (name, description, version, tags, last_used). 3. Use the new tool in later steps.
+- If no viable path, plan to call `request_human_assistance` with a summary of failures.
 
 Available Tools: {tool_names}
 Original User Goal: {state['user_goal']}
@@ -192,7 +264,18 @@ Respond with only the new, revised plan, formatted as a numbered list."""
     response = invoke_llm([HumanMessage(content=replan_prompt)], available_tools=[])
     print("--- NEW PLAN CREATED ---")
     print(response.content)
-    return {"plan": response.content}
+    
+    # Prune messages if bloated (>10) to prevent context overflow
+    messages = state.get('messages', [])
+    if len(messages) > 10:
+        summary = "Summary of early history: Initial attempts failed due to tool errors; proceeding with revised plan."
+        messages = [HumanMessage(content=summary)] + messages[-10:]
+    
+    return {
+        "plan": response.content, 
+        "replan_attempts": current_attempts + 1,
+        "messages": messages
+    }
 
 def planner(state: AgentState):
     """The planner node. It invokes the LLM with the current state to decide the next action."""
@@ -200,14 +283,15 @@ def planner(state: AgentState):
     completed_steps_str = "\n".join(f"- {step}" for step in state.get('completed_plan_steps', []))
     if not completed_steps_str:
         completed_steps_str = "No steps completed yet."
+    failed_actions_str = ", ".join(state.get('failed_actions', [])) or "None"
 
-    # ENHANCED PROMPT FOR CRITICAL EVALUATION
     plan_context = HumanMessage(content=f"""You are an autonomous AI agent. Your job is to execute a plan to fulfill the user's goal.
-Review the plan, the conversation history, and the steps you have already completed. 
+Review the plan, the conversation history, the steps you have already completed, and failed_actions: {failed_actions_str}.
 
 **Analyze the most recent tool results very carefully.**
 - If the last tool call returned useful information that helps achieve the user's goal, continue with the next step in the plan.
 - If the last tool call failed or returned unhelpful, irrelevant, or generic information (like a help page), you MUST recognize this as a failure. Do not proceed with the plan. Instead, your response should be a call to the `request_human_assistance` tool, explaining that the previous approach failed and that you need a new strategy.
+- If failed_actions show patterns (e.g., repeated API failures), suggest creating a new tool or escalating.
 
 Decide on the next step:
 1. If you have gathered all the necessary information and can now directly answer the user's goal, provide the final answer as a concise summary.
@@ -224,7 +308,7 @@ You have already completed the following steps:
     else:
         messages_for_llm = current_messages + [plan_context]
 
-    available_tools = base_tools + load_generated_tools()
+    available_tools = base_tools + load_generated_tools(state['plan'])  # Phase 3: Pass plan for filtered loading
     response = invoke_llm(messages_for_llm, available_tools=available_tools)
     return {"messages": current_messages + [response]}
 
@@ -297,6 +381,22 @@ def after_permission_check(state: AgentState):
         return "planner"
     return "tool_executor"
 
+def handle_circuit_breaker(state: AgentState):
+    """Handles the circuit breaker logic when the agent is stuck in a loop."""
+    print("\n--- CIRCUIT BREAKER TRIPPED ---")
+    print(f"The agent has failed to create a working plan after {MAX_REPLAN_ATTEMPTS} attempts.")
+    print("Please provide guidance on how to proceed. You can suggest a new plan, a specific tool to use, or type 'exit' to terminate.")
+    
+    response = input("Your guidance: ")
+    
+    if response.lower() == 'exit':
+        return {"messages": state['messages'] + [HumanMessage(content="exit")]}
+
+    return {
+        "messages": state['messages'] + [HumanMessage(content=response)],
+        "replan_attempts": 0 
+    }
+
 def handle_human_assistance(state: AgentState):
     last_message = state['messages'][-1]
     if not last_message.tool_calls:
@@ -333,11 +433,39 @@ def mark_step_complete(state: AgentState):
 
 def handle_error(state: AgentState):
     last_message = state['messages'][-1]
-    error_message = f"The last tool call failed with the following output:\n\n{last_message.content}\n\nPlease analyze this error and create a plan to recover."
-    return {"messages": state['messages'] + [HumanMessage(content=error_message)]}
+
+    # Log the failed action
+    failed_tool_name = "unknown_tool"
+    if len(state['messages']) > 1:
+        ai_message_with_tool_call = state['messages'][-2]
+        if isinstance(ai_message_with_tool_call, AIMessage) and ai_message_with_tool_call.tool_calls:
+            failed_tool_name = ai_message_with_tool_call.tool_calls[0].get("name", "unknown_tool")
+
+    failed_actions = state.get('failed_actions', [])
+    if failed_tool_name not in failed_actions:
+        failed_actions.append(failed_tool_name)
+
+    # Classify error (e.g., parse HTTP codes)
+    content_str = str(last_message.content)
+    error_category = "Unknown error"
+    if "401" in content_str or "Unauthorized" in content_str:
+        error_category = "Authentication failure (e.g., invalid API key)"
+    elif "403" in content_str or "Forbidden" in content_str:
+        error_category = "Access forbidden (e.g., blocked site)"
+    elif "429" in content_str or "Too Many Requests" in content_str:
+        error_category = "Rate limit exceeded"
+    elif "404" in content_str or "Not Found" in content_str:
+        error_category = "Resource not found"
+
+    error_message = f"The last tool call failed with the following output:\n\n{last_message.content}\n\nError Category: {error_category}\nPlease analyze this error and create a plan to recover."
+
+    return {
+        "messages": state['messages'] + [HumanMessage(content=error_message)],
+        "failed_actions": failed_actions
+    }
 
 def execute_tools(state: AgentState):
-    available_tools = base_tools + load_generated_tools()
+    available_tools = base_tools + load_generated_tools(state['plan'])  # Phase 3: Filtered by plan
     tool_node = ToolNode(available_tools)
     
     result_dict = tool_node.invoke({"messages": state['messages']})
@@ -383,6 +511,12 @@ Your response should be only the text of the final answer, without any prefixes.
 """
     return {"final_report": report.strip()}
 
+def route_after_replan(state: AgentState):
+    """Routes to the planner or trips the circuit breaker based on replan attempts."""
+    if state.get('replan_attempts', 0) >= MAX_REPLAN_ATTEMPTS:
+        return "circuit_breaker"
+    return "planner"
+
 # --- Graph Definition ---
 workflow = StateGraph(AgentState)
 
@@ -394,6 +528,7 @@ workflow.add_node("mark_step_complete", mark_step_complete)
 workflow.add_node("handle_human_assistance", handle_human_assistance)
 workflow.add_node("request_permission", request_permission)
 workflow.add_node("handle_error", handle_error)
+workflow.add_node("handle_circuit_breaker", handle_circuit_breaker)
 workflow.add_node("check_for_exit", check_for_exit)
 workflow.add_node("final_report_generator", generate_final_report)
 
@@ -408,7 +543,10 @@ workflow.add_conditional_edges("planner", route_after_planner, {
 workflow.add_conditional_edges("handle_human_assistance", check_for_exit, {
     "replan": "replan", "end": "final_report_generator"
 })
-workflow.add_edge("replan", "planner")
+workflow.add_conditional_edges("replan", route_after_replan, {
+    "planner": "planner", "circuit_breaker": "handle_circuit_breaker"
+})
+workflow.add_edge("handle_circuit_breaker", "check_for_exit")
 workflow.add_conditional_edges("request_permission", after_permission_check, {
     "planner": "planner", "tool_executor": "tool_executor"
 })
@@ -427,7 +565,9 @@ def run_agent_task(goal: str, session_messages: list):
     inputs = {
         "user_goal": goal,
         "messages": session_messages,
-        "completed_plan_steps": []
+        "completed_plan_steps": [],
+        "replan_attempts": 0,
+        "failed_actions": []
     }
     
     final_state = None
